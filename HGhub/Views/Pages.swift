@@ -80,7 +80,7 @@ struct FeedFromList: View {
     var items: [VideoCard]
     var start: Int
     var body: some View {
-        FeedPager(items: items)
+        FeedPager(items: items, onNearEnd: {})
     }
 }
 
@@ -105,7 +105,7 @@ struct RankView: View {
             ForEach(items) { r in
                 HStack {
                     Text("\(r.rank)").font(.headline.monospacedDigit()).frame(width: 30)
-                    AsyncImage(url: URL(string: r.cover)) { img in img.resizable() } placeholder: {
+                    AsyncImage(url: URL(string: r.cover)) { (img: Image) in img.resizable() } placeholder: {
                         Color.gray.opacity(0.2)
                     }.frame(width: 50, height: 70).clipShape(RoundedRectangle(cornerRadius: 6))
                     VStack(alignment: .leading) {
@@ -116,7 +116,7 @@ struct RankView: View {
             }
         }
         .task { await load() }
-        .onChange(of: kind) { Task { await load() } }
+        .onChange(of: kind) { _ in Task { await load() } }
     }
 
     func load() async {
@@ -148,7 +148,7 @@ struct CategoryView: View {
                 ForEach(Self.channels, id: \.cate) { ch in
                     Section(ch.name) {
                         ForEach(rows[ch.cate] ?? []) { v in
-                            NavigationLink(v.title) { FeedPager(items: [v]) }
+                            NavigationLink(v.title) { FeedPager(items: [v], onNearEnd: {}) }
                         }
                     }
                 }
@@ -246,7 +246,7 @@ struct ProfileView: View {
                     }.pickerStyle(.segmented)
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 90))]) {
                         ForEach(cards, id: \.id) { c in
-                            AsyncImage(url: URL(string: c.cover)) { img in img.resizable() }
+                            AsyncImage(url: URL(string: c.cover)) { (img: Image) in img.resizable() }
                                 .aspectRatio(3/4, contentMode: .fill)
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
                         }
@@ -258,7 +258,7 @@ struct ProfileView: View {
             }
             .navigationTitle("我的")
             .task { await loadCards() }
-            .onChange(of: tab) { Task { await loadCards() } }
+            .onChange(of: tab) { _ in Task { await loadCards() } }
         }
     }
 
