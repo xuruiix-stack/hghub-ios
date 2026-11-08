@@ -21,13 +21,14 @@ func aesCBCDecrypt(_ data: Data, key: [UInt8], iv: [UInt8]) -> Data? {
     guard !data.isEmpty, data.count % kCCBlockSizeAES128 == 0 else { return nil }
     var out = Data(count: data.count)
     var outLen = 0
+    let outCount = out.count
     let status = data.withUnsafeBytes { dPtr in
         out.withUnsafeMutableBytes { oPtr in
             CCCrypt(
                 UInt32(kCCDecrypt), UInt32(kCCAlgorithmAES128),
                 CCOptions(0), key, kCCKeySizeAES128, iv,
                 dPtr.baseAddress, data.count,
-                oPtr.baseAddress, out.count, &outLen
+                oPtr.baseAddress, outCount, &outLen
             )
         }
     }
