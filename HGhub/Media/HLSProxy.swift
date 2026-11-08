@@ -91,9 +91,11 @@ public final class HLSProxy: NSObject, ObservableObject {
 
     static func parsePath(_ req: String) -> String {
         // Request line: "GET /hls?u=... HTTP/1.1"
-        if let first = req.components(separatedBy: "\r\n").first,
-           let parts = Array(first.split(separator: " ")), parts.count >= 2 {
-            return String(parts[1])
+        if let first = req.components(separatedBy: "\r\n").first {
+            let parts = Array(first.split(separator: " "))
+            if parts.count >= 2 {
+                return String(parts[1])
+            }
         }
         return "/"
     }
