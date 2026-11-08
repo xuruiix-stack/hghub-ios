@@ -17,7 +17,9 @@ struct ContentView: View {
         .sheet(isPresented: $store.loginOpen) {
             LoginView()
         }
-        .tabBar(isHidden: store.tab == .home) {
+        // Original App.tsx always renders the bottom TabBar; hiding it on
+        // home made the home feed have no tab bar at all.
+        .tabBar(isHidden: false) {
             HStack {
                 TabItem(icon: "house", label: "首页", tab: .home)
                 TabItem(icon: "magnifyingglass", label: "搜索", tab: .search)
@@ -59,7 +61,7 @@ extension View {
     }
 }
 
-// MARK: - Home feed (immersive vertical reels, mirrors Feed.tsx + Home.tsx)
+// MARK: - Home feed (mirrors Feed.tsx + Home.tsx)
 
 struct HomeView: View {
     @StateObject private var api = API.shared
@@ -128,21 +130,59 @@ struct FeedPager: View {
     var items: [VideoCard]
     var onNearEnd: () -> Void
     @State private var selection: Int = 0
+    @State private var epMap: [Int: Int] = [:]
+    @State private var showComments = false
+    @State private var showEpisodes = false
+    @State private var sheetDetail: Detail?
+    @State private var sheetCard: VideoCard?
+    @State private var sheetEp: Int = 1
+
+    private var currentCard: VideoCard? {
+        items.indices.contains(selection) ? items[selection] : items.first
+    }
 
     var body: some View {
         TabView(selection: $selection) {
             ForEach(items.indices, id: \.self) { idx in
-                FeedPage(card: items[idx], index: idx, total: items.count)
-                    .tag(idx)
-                    .onChange(of: selection) { _ in
-                        if idx >= items.count - 2 { onNearEnd() }
-                    }
+                FeedPage(
+                    card: items[idx],
+                    index: idx,
+                    total: items.count,
+                    isActive: idx == selection,
+                    epMap: $epMap,
+                    requestEpisodes: { detail, card, ep in
+                        sheetDetail = detail
+                        sheetCard = card
+                        sheetEp = ep
+                        showEpisodes = true
+                    },
+                    requestComments: { _ in showComments = true }
+                )
+                .tag(idx)
             }
         }
         .tabViewStyle(.page(indexDisplayMode: .never))
-        #if !os(tvOS)
-        .tabViewStyle(.page)
-        #endif
+        .onChange(of: selection) { _ in
+            if selection >= items.count - 2 { onNearEnd() }
+        }
+        .sheet(isPresented: $showEpisodes) {
+            EpisodesView(
+                detail: sheetDetail,
+                fallbackCount: sheetCard?.episode_count ?? 0,
+                current: sheetEp,
+                onPick: { ep in
+                    if let id = sheetCard?.id { epMap[id] = ep }
+                    showEpisodes = false
+                }
+            )
+        }
+        .sheet(isPresented: $showComments) {
+            if let card = currentCard {
+                CommentsView(videoId: card.id, ep: epMap[card.id] ?? 1)
+            } else {
+                Text("暂无内容")
+            }
+        }
     }
 }
 
@@ -150,17 +190,71 @@ struct FeedPage: View {
     var card: VideoCard
     var index: Int
     var total: Int
+    var isActive: Bool
+    @Binding var epMap: [Int: Int]
+    var requestEpisodes: (Detail?, VideoCard, Int) -> Void
+    var requestComments: (Int) -> Void
+
     @StateObject private var api = API.shared
     @StateObject private var store = AppStore.shared
     @State private var detail: Detail?
-    @State private var playInfo: PlayInfo?
-    @State private var showComments = false
-    @State private var showEpisodes = false
+    @State private var playURL: String?
+    @State private var playLoading = true
+    @State private var playError: String?
+    @State private var isPlaying = false
+    @State private var loadedKey = ""
+
+    private var currentEp: Int { epMap[card.id] ?? 1 }
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
-            CoverPlayerView(card: card, ep: currentEp, detail: $detail, playInfo: $playInfo)
-            // Info overlay
+            CoverPlayerView(
+                card: card,
+                active: isActive,
+                urlString: playURL,
+                muted: store.muted,
+                volume: store.volume,
+                isPlaying: $isPlaying,
+                errorMsg: $playError,
+                onProgress: { t, dur in
+                    store.addHistory(card.id, ep: currentEp, t: t, dur: dur)
+                }
+            )
+            if playLoading, playURL == nil {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+            }
+            if playURL != nil, playError == nil, !playLoading, !isPlaying {
+                ZStack {
+                    Circle()
+                        .fill(Color.black.opacity(0.45))
+                        .frame(width: 66, height: 66)
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 26))
+                        .foregroundStyle(.white)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
+            }
+            if let playError {
+                VStack(spacing: 10) {
+                    Text("视频暂时无法加载").foregroundStyle(.white)
+                    Text(playError)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.75))
+                    Button("重试") {
+                        self.playError = nil
+                        playURL = nil
+                        Task { await loadPlayInfo() }
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(.white)
+                }
+                .padding(16)
+                .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
             VStack(alignment: .leading, spacing: 8) {
                 if let d = detail {
                     Text(d.title).font(.headline).foregroundStyle(.white)
@@ -177,7 +271,6 @@ struct FeedPage: View {
             .background(
                 LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .top, endPoint: .bottom)
             )
-            // Action rail
             VStack(spacing: 18) {
                 Button { Task { await toggleLike() } } label: {
                     VStack(spacing: 2) {
@@ -191,13 +284,13 @@ struct FeedPage: View {
                         Text(fmt(card.collect_count)).font(.caption)
                     }
                 }
-                Button { showComments = true } label: {
+                Button { requestComments(card.id) } label: {
                     VStack(spacing: 2) {
                         Image(systemName: "message")
                         Text(fmt(card.comment_count)).font(.caption)
                     }
                 }
-                Button { showEpisodes = true } label: {
+                Button { requestEpisodes(detail, card, currentEp) } label: {
                     Image(systemName: "list.bullet")
                 }
             }
@@ -207,16 +300,35 @@ struct FeedPage: View {
         }
         .task {
             detail = try? await api.video(id: card.id)
+            await loadPlayInfo()
         }
-        .sheet(isPresented: $showComments) {
-            CommentsView(videoId: card.id, ep: currentEp)
-        }
-        .sheet(isPresented: $showEpisodes) {
-            EpisodesView(detail: detail)
+        .onChange(of: currentEp) { _ in
+            playURL = nil
+            playError = nil
+            Task { await loadPlayInfo() }
         }
     }
 
-    private var currentEp: Int { 1 }
+    func loadPlayInfo() async {
+        let key = "\(card.id):\(currentEp)"
+        guard loadedKey != key || playURL == nil else { return }
+        loadedKey = key
+        playLoading = true
+        playError = nil
+        defer { playLoading = false }
+        do {
+            let info = try await api.play(id: card.id, ep: currentEp)
+            guard !info.video_url.isEmpty else { throw APIError.network("暂无播放地址") }
+            await HLSProxy.shared.waitUntilReady()
+            guard HLSProxy.shared.isReady else {
+                throw APIError.network("本地代理未就绪，请重试")
+            }
+            playURL = HGAUrl.playlist(info.video_url, proxy: HLSProxy.shared)
+            store.addHistory(card.id, ep: currentEp)
+        } catch {
+            playError = error.localizedDescription
+        }
+    }
 
     func toggleLike() async {
         let on = store.toggleLikeLocal(card.id)
@@ -228,67 +340,295 @@ struct FeedPage: View {
     }
 }
 
-// Cover + AVPlayer with poster, tap-to-pause, progress polling for history.
+// MARK: - UIKit-backed player (poster + AVPlayerLayer with real layout)
+
+final class PlayerContainerView: UIView {
+    private var posterView: UIImageView!
+    private var spinner: UIActivityIndicatorView!
+    private var label: UILabel!
+
+    override class var layerClass: Class { AVPlayerLayer.self }
+
+    var videoLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+
+    private func setup() {
+        backgroundColor = .black
+        videoLayer.videoGravity = .resizeAspectFill
+        posterView = UIImageView()
+        posterView.contentMode = .scaleAspectFill
+        posterView.clipsToBounds = true
+        posterView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        posterView.isUserInteractionEnabled = false
+        addSubview(posterView)
+        spinner = UIActivityIndicatorView(style: .large)
+        spinner.color = .white
+        spinner.isUserInteractionEnabled = false
+        spinner.startAnimating()
+        addSubview(spinner)
+        label = UILabel()
+        label.textColor = .white
+        label.font = .preferredFont(forTextStyle: .subheadline)
+        label.numberOfLines = 2
+        label.textAlignment = .center
+        label.isHidden = true
+        label.isUserInteractionEnabled = false
+        addSubview(label)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        videoLayer.frame = bounds
+        posterView.frame = bounds
+        spinner.center = CGPoint(x: bounds.width / 2, y: bounds.height / 2)
+        label.frame = CGRect(x: 16, y: bounds.height - 84, width: bounds.width - 32, height: 44)
+    }
+
+    func setPoster(_ image: UIImage?) { posterView.image = image }
+    func setLoading(_ loading: Bool) {
+        if loading { spinner.startAnimating() } else { spinner.stopAnimating() }
+    }
+    func setMessage(_ text: String?) {
+        label.text = text
+        label.isHidden = text == nil
+    }
+    func hidePoster() { posterView.isHidden = true }
+    func showPoster() { posterView.isHidden = false }
+}
+
 struct CoverPlayerView: UIViewRepresentable {
     var card: VideoCard
-    var ep: Int
-    @Binding var detail: Detail?
-    @Binding var playInfo: PlayInfo?
-    @State private var player: AVPlayer?
+    var active: Bool
+    var urlString: String?
+    var muted: Bool
+    var volume: Double
+    @Binding var isPlaying: Bool
+    @Binding var errorMsg: String?
+    var onProgress: (Double, Double) -> Void
 
-    func makeUIView(context: Context) -> UIView {
-        let container = UIView()
-        container.backgroundColor = .black
-        let layer = AVPlayerLayer()
-        layer.videoGravity = .resizeAspectFill
-        container.layer.addSublayer(layer)
-        context.coordinator.playerLayer = layer
-        context.coordinator.container = container
-        // Tap to pause/play
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> PlayerContainerView {
+        let container = PlayerContainerView(frame: .zero)
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.toggle))
         container.addGestureRecognizer(tap)
         return container
     }
 
-    func updateUIView(_ uiView: UIView, context: Context) {
-        // Load cover as poster placeholder
-        Task {
-            if let img = try? await CoverLoader.shared.loadUIImage(url: card.cover) {
-                context.coordinator.posterView?.image = img
-            }
-        }
+    func updateUIView(_ uiView: PlayerContainerView, context: Context) {
+        let c = context.coordinator
+        c.onPlayingChange = { playing in isPlaying = playing }
+        c.onError = { msg in errorMsg = msg }
+        c.sync(container: uiView, card: card, url: urlString, active: active,
+               muted: muted, volume: volume, onProgress: onProgress)
     }
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(detail: detail, playInfo: playInfo)
+    static func dismantleUIView(_ uiView: PlayerContainerView, coordinator: Coordinator) {
+        coordinator.teardown()
     }
 
     final class Coordinator: NSObject {
-        var playerLayer: AVPlayerLayer?
-        var container: UIView?
-        var posterView: UIImageView?
-        var player: AVPlayer?
-        var detail: Detail?
-        var playInfo: PlayInfo?
-        var historyTimer: Timer?
+        private var container: PlayerContainerView?
+        private var player: AVPlayer?
+        private var currentURL: String?
+        private var active = false
+        private var userPaused = false
+        private var posterCover: String?
+        private var posterTask: Task<Void, Never>?
+        private var timeControlObs: NSKeyValueObservation?
+        private var currentItemObs: NSKeyValueObservation?
+        private var itemStatusObs: NSKeyValueObservation?
+        private var failedObs: NSObjectProtocol?
+        private var historyTimer: Timer?
 
-        init(detail: Detail?, playInfo: PlayInfo?) {
-            self.detail = detail
-            self.playInfo = playInfo
+        var onPlayingChange: ((Bool) -> Void)?
+        var onError: ((String?) -> Void)?
+        var onProgress: ((Double, Double) -> Void)?
+
+        func sync(container: PlayerContainerView, card: VideoCard, url: String?,
+                  active: Bool, muted: Bool, volume: Double,
+                  onProgress: @escaping (Double, Double) -> Void) {
+            self.container = container
+            self.onProgress = onProgress
+            applyVolume(muted: muted, volume: volume)
+            loadPosterIfNeeded(card: card)
+            if url != currentURL {
+                currentURL = url
+                rebuildPlayer(url: url)
+            }
+            let becameActive = active && !self.active
+            let becameInactive = !active && self.active
+            self.active = active
+            if becameInactive {
+                userPaused = false
+                pauseInternal()
+            }
+            if becameActive, player != nil, !userPaused {
+                playInternal()
+            }
+        }
+
+        func teardown() {
+            historyTimer?.invalidate()
+            historyTimer = nil
+            removeObservers()
+            player?.pause()
+            player = nil
+            container?.videoLayer.player = nil
+            container = nil
+            posterTask?.cancel()
+            posterTask = nil
         }
 
         @objc func toggle() {
-            if player?.rate != 0 { player?.pause() } else { player?.play() }
+            guard let p = player else { return }
+            if p.rate != 0 {
+                userPaused = true
+                p.pause()
+            } else {
+                userPaused = false
+                p.play()
+            }
         }
 
-        @MainActor
-        func play(url: String) {
-            guard let u = URL(string: url) else { return }
-            player = AVPlayer(url: u)
-            player?.volume = AppStore.shared.muted ? 0 : Float(AppStore.shared.volume)
-            playerLayer?.player = player
-            player?.play()
+        private func rebuildPlayer(url: String?) {
+            removeObservers()
+            player?.pause()
+            player = nil
+            container?.videoLayer.player = nil
+            container?.showPoster()
+            guard let url, let u = URL(string: url) else {
+                container?.setLoading(false)
+                currentURL = nil
+                return
+            }
+            let p = AVPlayer(url: u)
+            player = p
+            container?.videoLayer.player = p
+            container?.setLoading(true)
+            container?.setMessage("加载中…")
+            observe(p)
+            if active, !userPaused {
+                playInternal()
+            } else {
+                p.pause()
+            }
             startHistoryTimer()
+        }
+
+        private func playInternal() {
+            player?.play()
+        }
+
+        private func pauseInternal() {
+            player?.pause()
+            onPlayingChange?(false)
+        }
+
+        private func applyVolume(muted: Bool, volume: Double) {
+            let desired: Float = muted ? 0 : Float(volume)
+            if let p = player, p.volume != desired { p.volume = desired }
+        }
+
+        private func observe(_ p: AVPlayer) {
+            timeControlObs = p.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+                DispatchQueue.main.async { self?.syncPlayingState() }
+            }
+            currentItemObs = p.observe(\.currentItem, options: [.new]) { [weak self] player, _ in
+                DispatchQueue.main.async { self?.observeCurrentItem(player.currentItem) }
+            }
+            observeCurrentItem(p.currentItem)
+            failedObs = NotificationCenter.default.addObserver(
+                forName: AVPlayerItem.failedToPlayToEndTimeNotification,
+                object: nil, queue: .main
+            ) { [weak self] note in
+                let msg = (note.object as? AVPlayerItem)?.error?.localizedDescription ?? "播放失败"
+                self?.handleFailure(msg)
+            }
+        }
+
+        private func observeCurrentItem(_ item: AVPlayerItem?) {
+            itemStatusObs?.invalidate()
+            itemStatusObs = nil
+            guard let item else { return }
+            itemStatusObs = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+                DispatchQueue.main.async { self?.handleItemStatus(item) }
+            }
+        }
+
+        private func removeObservers() {
+            timeControlObs?.invalidate()
+            timeControlObs = nil
+            currentItemObs?.invalidate()
+            currentItemObs = nil
+            itemStatusObs?.invalidate()
+            itemStatusObs = nil
+            if let failedObs {
+                NotificationCenter.default.removeObserver(failedObs)
+                self.failedObs = nil
+            }
+        }
+
+        private func handleItemStatus(_ item: AVPlayerItem) {
+            switch item.status {
+            case .readyToPlay:
+                container?.setLoading(false)
+                container?.setMessage(nil)
+            case .failed:
+                handleFailure(item.error?.localizedDescription ?? "播放失败")
+            case .unknown:
+                break
+            @unknown default:
+                break
+            }
+        }
+
+        private func syncPlayingState() {
+            guard let p = player else { return }
+            let playing = p.timeControlStatus == .playing
+            if playing {
+                container?.hidePoster()
+                container?.setLoading(false)
+                container?.setMessage(nil)
+            } else if p.timeControlStatus == .waitingToPlayNonZeroRate, p.rate != 0 {
+                container?.setLoading(true)
+            } else {
+                container?.setLoading(false)
+            }
+            onPlayingChange?(playing)
+        }
+
+        private func handleFailure(_ message: String) {
+            player?.pause()
+            container?.setLoading(false)
+            container?.setMessage(nil)
+            onPlayingChange?(false)
+            onError?(message)
+        }
+
+        private func loadPosterIfNeeded(card: VideoCard) {
+            guard posterCover != card.cover else { return }
+            posterCover = card.cover
+            container?.showPoster()
+            posterTask?.cancel()
+            guard !card.cover.isEmpty else { return }
+            let cover = card.cover
+            posterTask = Task {
+                guard let img = try? await CoverLoader.shared.loadUIImage(url: cover) else { return }
+                await MainActor.run { [weak self] in
+                    guard let self, self.posterCover == cover else { return }
+                    self.container?.setPoster(img)
+                }
+            }
         }
 
         private func startHistoryTimer() {
@@ -298,9 +638,7 @@ struct CoverPlayerView: UIViewRepresentable {
                 let t = p.currentTime().seconds
                 let dur = p.currentItem?.duration.seconds ?? 0
                 if t.isFinite {
-                    Task { @MainActor in
-                        AppStore.shared.addHistory(self?.detail?.id ?? 0, ep: 1, t: t, dur: dur.isFinite ? dur : 0)
-                    }
+                    self?.onProgress?(t, dur.isFinite ? dur : 0)
                 }
             }
         }
@@ -356,13 +694,61 @@ struct CommentsView: View {
 
 struct EpisodesView: View {
     var detail: Detail?
+    var fallbackCount: Int
+    var current: Int
+    var onPick: (Int) -> Void
+    @State private var asc = true
     @Environment(\.dismiss) private var dismiss
+
+    private var episodes: [Episode] {
+        if let eps = detail?.episodes, !eps.isEmpty {
+            return asc ? eps : Array(eps.reversed())
+        }
+        let n = detail?.episode_count ?? fallbackCount
+        guard n > 0 else { return [] }
+        let generated = (1...n).map { Episode(ep_num: $0, title: "第\($0)集", duration: 0, status: 1) }
+        return asc ? generated : Array(generated.reversed())
+    }
+
     var body: some View {
         NavigationStack {
-            List(detail?.episodes ?? []) { ep in
-                Button("\(ep.title) · \(fmtTime(ep.duration))") { dismiss() }
+            VStack(alignment: .leading, spacing: 12) {
+                if episodes.isEmpty {
+                    Text("暂无剧集")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 40)
+                } else {
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                        ForEach(episodes) { ep in
+                            Button {
+                                onPick(ep.ep_num)
+                                dismiss()
+                            } label: {
+                                Text("\(ep.ep_num)")
+                                    .font(.subheadline)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                                    .background(
+                                        ep.ep_num == current ? Color.accentColor : Color(.secondarySystemBackground),
+                                        in: RoundedRectangle(cornerRadius: 8)
+                                    )
+                            }
+                        }
+                    }
+                    Text("点选即切换播放")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
+            .padding()
             .navigationTitle(detail?.title ?? "选集")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(asc ? "倒序" : "正序") { asc.toggle() }
+                }
+            }
         }
     }
 }
