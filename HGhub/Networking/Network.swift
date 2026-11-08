@@ -55,7 +55,7 @@ public enum HGLine {
               comps.host != nil,
               comps.query == nil, comps.fragment == nil,
               (comps.path == "/" || comps.path.isEmpty) else { return nil }
-        var c = comps; c.path = nil
+        var c = comps; c.path = ""
         return c.url?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
@@ -222,7 +222,7 @@ public final class API: ObservableObject {
         var c = URLSessionConfiguration.default
         c.timeoutIntervalForRequest = 20
         c.timeoutIntervalForResource = 30
-        c.httpShouldHandleCookies = false
+        c.httpShouldSetCookies = false
         c.requestCachePolicy = .reloadIgnoringLocalCacheData
         c.urlCache = nil
         return URLSession(configuration: c)
@@ -275,7 +275,7 @@ public final class API: ObservableObject {
            !HGLine.trustedAuth(origin) {
             throw APIError.network("镜像线路仅供游客浏览；登录/注册请切换到固定线路")
         }
-        let (encoded, ctype): (String, String) = {
+        let (encoded, ctype): (String, String) = try {
             guard let body else { return ("", "") }
             let data = try JSONSerialization.data(withJSONObject: body)
             return (data.base64EncodedString(), "application/json")
@@ -489,7 +489,8 @@ public final class API: ObservableObject {
             if d.isEmpty { continue }
             let hosts = subs.isEmpty ? [d] : subs.map { "\($0).\(d)" }
             for h in hosts {
-                if !seen.insert(h) { continue }
+                if seen.contains(h) { continue }
+                seen.insert(h)
                 items.append(LineItem(name: nil, url: "https://\(h)", host: h))
                 if items.count >= HGLine.mirrorMax { break outer }
             }
@@ -631,7 +632,7 @@ public final class API: ObservableObject {
             } else if c == "/" {
                 if let next = it.next(), next == "/" {
                     while let n = it.next() { if n == "\n" { out.append("\n"); break } }
-                } else if let n = next {
+                } else if let n = it.next() {
                     out.append(c); out.append(n)
                 } else { out.append(c) }
             } else { out.append(c) }
