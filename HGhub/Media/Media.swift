@@ -8,8 +8,8 @@ import UIKit
 public enum HGMedia {
     public static let imgKey = Array("f5d965df75336270".utf8) // AES-128 key (ASCII)
     public static let imgIV  = Array("97b60394abc2fbe1".utf8) // AES-128-CBC IV (ASCII)
-    private static let imgCacheMax = 240
-    private static let plCacheMax = 60
+    static let imgCacheMax = 240
+    static let plCacheMax = 60
 
     static let imgCache = NSCache<NSString, NSData>()
     static let plCache = NSCache<NSString, NSString>()
@@ -24,7 +24,7 @@ func aesCBCDecrypt(_ data: Data, key: [UInt8], iv: [UInt8]) -> Data? {
     let status = data.withUnsafeBytes { dPtr in
         out.withUnsafeMutableBytes { oPtr in
             CCCrypt(
-                CCCryptOperation(kCCDecrypt), CCCryptAlgorithm(kCCAlgorithmAES128),
+                UInt32(kCCDecrypt), UInt32(kCCAlgorithmAES128),
                 CCOptions(0), key, kCCKeySizeAES128, iv,
                 dPtr.baseAddress, data.count,
                 oPtr.baseAddress, out.count, &outLen
@@ -49,7 +49,7 @@ func imageKind(_ buf: Data) -> String? {
     if b[0] == 0xFF && b[1] == 0xD8 { return "image/jpeg" }
     if b.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "image/png" }
     if buf.starts(with: "GIF8".utf8) { return "image/gif" }
-    if buf.starts(with: "RIFF".utf8) && b[8..<12] == Array("WEBP".utf8) { return "image/webp" }
+    if buf.starts(with: "RIFF".utf8) && b[8..<12] == ArraySlice(Array("WEBP".utf8)) { return "image/webp" }
     return nil
 }
 
@@ -64,7 +64,7 @@ public actor CoverLoader {
     init() {
         var c = URLSessionConfiguration.default
         c.timeoutIntervalForRequest = 15
-        c.httpShouldHandleCookies = false
+        c.httpShouldSetCookies = false
         session = URLSession(configuration: c)
     }
 
@@ -72,7 +72,7 @@ public actor CoverLoader {
         if let hit = cache[url] { return hit }
         guard let u = URL(string: url) else { throw APIError.network("地址无效") }
         var req = URLRequest(url: u)
-        req.setValue("\(API.shared.base)/", forHTTPHeaderField: "Referer")
+        req.setValue("\(await API.shared.base)/", forHTTPHeaderField: "Referer")
         let (data, _) = try await session.data(for: req)
         let plain: Data
         if imageKind(data) != nil {
