@@ -281,6 +281,7 @@ struct CoverPlayerView: UIViewRepresentable {
             if player?.rate != 0 { player?.pause() } else { player?.play() }
         }
 
+        @MainActor
         func play(url: String) {
             guard let u = URL(string: url) else { return }
             player = AVPlayer(url: u)
@@ -295,7 +296,7 @@ struct CoverPlayerView: UIViewRepresentable {
             historyTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
                 guard let p = self?.player else { return }
                 let t = p.currentTime().seconds
-                let dur = p.currentItem()?.duration.seconds ?? 0
+                let dur = p.currentItem?.duration.seconds ?? 0
                 if t.isFinite {
                     Task { @MainActor in
                         AppStore.shared.addHistory(self?.detail?.id ?? 0, ep: 1, t: t, dur: dur.isFinite ? dur : 0)
