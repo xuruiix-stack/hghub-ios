@@ -11,7 +11,7 @@ public enum APIError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .network(let m): return m
-        case .unauthorized: return "401"
+        case .unauthorized: return "请求失败（HTTP 401）：请重新登录"
         case .server(let m): return m
         case .decoding(let m): return m
         }
@@ -218,6 +218,21 @@ public final class API: ObservableObject {
     @Published public var lastError: String?
 
     private let session = SessionStore.shared
+    // Redirects are disabled at the session layer: the Rust side disables
+    // auto-following and re-validates every hop (only body-less guest
+    // GETs may be replayed). URLSession's default config would silently
+    // follow 301/302, turning the envelope POST into a plain GET and
+    // resending Authorization to the redirect target.
+    private final class NoRedirectDelegate: NSObject, URLSessionDelegate {
+        func urlSession(_ session: URLSession,
+                        task: URLSessionTask,
+                        willPerformHTTPRedirection newResponse: HTTPURLResponse,
+                        newRequest: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
     private lazy var urlSession: URLSession = {
         var c = URLSessionConfiguration.default
         c.timeoutIntervalForRequest = 20
@@ -225,7 +240,9 @@ public final class API: ObservableObject {
         c.httpShouldSetCookies = false
         c.requestCachePolicy = .reloadIgnoringLocalCacheData
         c.urlCache = nil
-        return URLSession(configuration: c)
+        return URLSession(configuration: c,
+                         delegate: NoRedirectDelegate(),
+                         delegateQueue: nil)
     }()
 
     public init() { loadBase() }
@@ -262,10 +279,11 @@ public final class API: ObservableObject {
 
     // --- edge ---
 
-    /// Mirrors net::edge: single POST envelope, 3 attempts for body-less GET,
-    /// no auto redirect following (URLSession default handles it; we keep default
-    /// for simplicity — the Rust side manually re-checks each hop),
-    /// 401/403 → "401", status==1 extracts data else msg.
+    /// Mirrors net::edge: single POST envelope (Content-Type:
+    /// application/json — without it the server answers 415), 3 attempts
+    /// for body-less GET with 350/700ms back-off, no auto-redirect
+    /// following, 401/403 → "401", status==1 extracts data else msg,
+    /// empty success body / missing data → JSON null.
     private func edge<T: Decodable>(
         method: String, path: String, body: [String: Any]? = nil, token: String? = nil
     ) async throws -> T {
@@ -286,6 +304,10 @@ public final class API: ObservableObject {
         }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
+        // Mirror reqwest's `.json()` in net.rs: it auto-sets
+        // Content-Type: application/json; without it the server rejects
+        // the envelope POST with HTTP 415 {"error":"请求无法处理"}.
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("\(origin)/", forHTTPHeaderField: "Referer")
         if let t = token, !t.isEmpty { req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization") }
@@ -303,13 +325,20 @@ public final class API: ObservableObject {
                     let snippet = String(data: data.prefix(160), encoding: .utf8) ?? ""
                     throw APIError.network("HTTP \(http.statusCode): \(snippet)")
                 }
-                if data.isEmpty { throw APIError.decoding("empty response") }
+                // Rust edge(): an empty (whitespace-only) success body is Ok(Null),
+                // not an error. Decoding T from JSON null keeps Optional-typed
+                // call sites (logout/like/…) succeeding exactly like the Rust side.
+                if let text = String(data: data, encoding: .utf8),
+                   text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return try JSONDecoder().decode(T.self, from: Data("null".utf8))
+                }
                 // Envelope: {status, data?, msg?}
                 let decoded = try JSONDecoder().decode(EdgeResponse<JSONValue>.self, from: data)
                 guard decoded.status == 1 else {
                     throw APIError.server(decoded.msg ?? "接口返回失败")
                 }
-                guard let d = decoded.data?.raw else { throw APIError.decoding("missing data") }
+                // Rust: status==1 returns data or Null when the key is absent.
+                let d = decoded.data?.raw ?? Data("null".utf8)
                 return try JSONDecoder().decode(T.self, from: d)
             } catch {
                 lastErr = error
