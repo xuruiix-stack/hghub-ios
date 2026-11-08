@@ -246,7 +246,13 @@ struct ProfileView: View {
                     }.pickerStyle(.segmented)
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 90))]) {
                         ForEach(cards, id: \.id) { c in
-                            AsyncImage(url: URL(string: c.cover)) { (img: Image) in img.resizable() }
+                            AsyncImage(url: URL(string: c.cover)) { phase in
+                                if let img = phase.image {
+                                    img.resizable()
+                                } else {
+                                    Color.gray
+                                }
+                            }
                                 .aspectRatio(3/4, contentMode: .fill)
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
                         }
