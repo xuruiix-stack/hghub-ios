@@ -20,7 +20,7 @@ final class ByteFetcher: @unchecked Sendable {
         self.baseProvider = baseProvider
         var c = URLSessionConfiguration.default
         c.timeoutIntervalForRequest = 20
-        c.httpShouldHandleCookies = false
+        c.httpShouldSetCookies = false
         c.urlCache = nil
         lazySession = URLSession(configuration: c)
     }
@@ -37,10 +37,10 @@ final class ByteFetcher: @unchecked Sendable {
     }
 }
 
-final class HLSProxy: NSObject, ObservableObject {
+public final class HLSProxy: NSObject, ObservableObject {
     static let shared = HLSProxy()
 
-    var base: String {
+    public var base: String {
         "http://127.0.0.1:\(port)"
     }
 
@@ -60,14 +60,14 @@ final class HLSProxy: NSObject, ObservableObject {
     private func start() {
         let params = NWParameters.tcp
         listener = try? NWListener(using: params)
-        listener?.service = NWListener.Service(name: "hg-hls")
+        listener?.service = NWListener.Service(name: "hg-hls", type: "_http._tcp")
         listener?.newConnectionHandler = { [weak self] conn in
             self?.handle(conn: conn)
         }
         listener?.stateUpdateHandler = { [weak self] state in
             if case .ready = state {
-                if case .tcp(let port) = self?.listener?.port ?? .invalid {
-                    self?.port = port.rawValue
+                if let port = self?.listener?.port?.rawValue {
+                    self?.port = port
                 }
             }
         }
@@ -92,7 +92,7 @@ final class HLSProxy: NSObject, ObservableObject {
     static func parsePath(_ req: String) -> String {
         // Request line: "GET /hls?u=... HTTP/1.1"
         if let first = req.components(separatedBy: "\r\n").first,
-           let parts = first.split(separator: " ") as [Substring], parts.count >= 2 {
+           let parts = Array(first.split(separator: " ")), parts.count >= 2 {
             return String(parts[1])
         }
         return "/"
