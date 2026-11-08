@@ -43,7 +43,8 @@ public struct VideoCard: Decodable, Identifiable {
     public var author: Author?
 }
 
-public struct Episode: Decodable {
+public struct Episode: Decodable, Identifiable {
+    public var id: Int { ep_num }
     public var ep_num: Int
     public var title: String
     public var duration: Double
