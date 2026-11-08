@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 
 struct ContentView: View {
@@ -50,10 +51,10 @@ struct TabItem: View {
 }
 
 extension View {
-    func tabBar(isHidden: Bool, content: Content) -> some View {
+    func tabBar<Content: View>(isHidden: Bool, @ViewBuilder content: () -> Content) -> some View {
         ZStack(alignment: .bottom) {
             self
-            if !isHidden { content }
+            if !isHidden { content() }
         }
     }
 }
@@ -133,7 +134,7 @@ struct FeedPager: View {
             ForEach(items.indices, id: \.self) { idx in
                 FeedPage(card: items[idx], index: idx, total: items.count)
                     .tag(idx)
-                    .onChange(of: selection) {
+                    .onChange(of: selection) { _ in
                         if idx >= items.count - 2 { onNearEnd() }
                     }
             }
