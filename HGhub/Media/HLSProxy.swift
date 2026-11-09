@@ -242,7 +242,11 @@ public final class HLSProxy: NSObject, ObservableObject {
             "Connection: close",
             "", ""
         ].joined(separator: "\r\n")
-        var full = Data((headers + "\r\n").utf8)
+        // The joined header block already ends with "\r\n\r\n". Appending
+        // another "\r\n" here used to shift the body by 2 bytes relative
+        // to Content-Length (AVPlayer got "\r\n" + body minus the last
+        // 2 bytes: unparseable m3u8, corrupted AES key, lost TS sync).
+        var full = Data(headers.utf8)
         full.append(body)
         sendAll(conn: conn, data: full)
     }
