@@ -24,6 +24,66 @@ enum HLSProxyError: Error, LocalizedError {
     }
 }
 
+// MARK: - Structured playback diagnostics
+
+/// One pinpointable playback failure. Surfaces in the "视频暂时无法加载"
+/// overlay (FeedPage) so the next failure names the exact failing step,
+/// host and HTTP status instead of a bare localizedDescription.
+/// Foundation-only so Linux typecheck covers it.
+struct PlaybackDiagnostic: Error {
+    var step: String        // playlist / key / segment / proxy / item / player
+    var host: String        // failing host (upstream CDN host, or 127.0.0.1 for loopback)
+    var httpStatus: Int?
+    var code: Int?          // NSError code when known (e.g. AVError)
+    var domain: String?     // error domain (e.g. AVFoundationErrorDomain)
+    var message: String
+
+    func diagnosticString() -> String {
+        var s = "【\(step)】\(message)"
+        if !host.isEmpty { s += " host=\(host)" }
+        if let httpStatus { s += " http=\(httpStatus)" }
+        if let domain { s += " domain=\(domain)" }
+        if let code, code != 0 { s += " code=\(code)" }
+        return s
+    }
+}
+
+extension PlaybackDiagnostic: LocalizedError {
+    var errorDescription: String? { diagnosticString() }
+}
+
+/// Diagnose any thrown error into a PlaybackDiagnostic for display.
+func diagnoseFailure(_ error: Error, step: String, host: String) -> PlaybackDiagnostic {
+    if let d = error as? PlaybackDiagnostic { return d }
+    let ns = error as NSError
+    let http = httpStatusFromMessage(error.localizedDescription)
+    return PlaybackDiagnostic(step: step, host: host, httpStatus: http,
+        code: ns.code, domain: ns.domain, message: error.localizedDescription)
+}
+
+/// "HTTP 502" embedded in APIError.network messages → 502
+func httpStatusFromMessage(_ message: String) -> Int? {
+    let parts = message.split(separator: " ")
+    guard parts.count >= 2, parts[0] == "HTTP" else { return nil }
+    return Int(parts[1])
+}
+
+/// URL host, or "" when unparsable.
+func hostOf(_ urlString: String) -> String {
+    URL(string: urlString)?.host ?? ""
+}
+
+/// For a proxy URL (http://127.0.0.1:port/seg?u=<encoded upstream>),
+/// recover the upstream host so a CDN failure is blamed on the CDN,
+/// not on the loopback proxy.
+func upstreamHostOf(_ proxyURLString: String) -> String? {
+    guard let u = URL(string: proxyURLString),
+          let comp = u.query else { return nil }
+    let target = HLSProxy.paramU(comp)
+    guard !target.isEmpty else { return nil }
+    return URL(string: target)?.host
+}
+
 // MARK: - Fetch bytes (mirrors net::fetch_bytes: Referer=<base>/, 20s timeout)
 
 final class ByteFetcher: @unchecked Sendable {
@@ -39,13 +99,27 @@ final class ByteFetcher: @unchecked Sendable {
         lazySession = URLSession(configuration: c)
     }
 
+    private static let hostOf: (String) -> String = { url in URL(string: url)?.host ?? "" }
+
     func fetch(_ url: String) async throws -> (mime: String?, data: Data) {
         guard let u = URL(string: url) else { throw APIError.network("地址无效") }
         var req = URLRequest(url: u)
         req.setValue("\(await baseProvider())/", forHTTPHeaderField: "Referer")
-        let (data, resp) = try await lazySession.data(for: req)
+        let (data, resp): (Data, URLResponse)
+        do {
+            (data, resp) = try await lazySession.data(for: req)
+        } catch {
+            let ns = error as NSError
+            throw PlaybackDiagnostic(step: "segment", host: Self.hostOf(url),
+                httpStatus: nil, code: ns.code, domain: ns.domain,
+                message: "CDN 直连失败: \(error.localizedDescription)")
+        }
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(code) else { throw APIError.network("HTTP \(code)") }
+        guard (200..<300).contains(code) else {
+            throw PlaybackDiagnostic(step: "segment", host: Self.hostOf(url),
+                httpStatus: code, code: code, domain: "HTTP",
+                message: "CDN 返回 HTTP \(code)")
+        }
         let mime = (resp as? HTTPURLResponse)?.mimeType
         return (mime, data)
     }
@@ -68,6 +142,9 @@ public final class HLSProxy: NSObject, ObservableObject {
     public var base: String {
         "http://127.0.0.1:\(port)"
     }
+
+    private(set) var lastDiagnostic: String?
+    private(set) var listenerFailed: String?
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "hg.hlsproxy", qos: .utility)
@@ -95,23 +172,79 @@ public final class HLSProxy: NSObject, ObservableObject {
 
     private func start() {
         let params = NWParameters.tcp
-        listener = try? NWListener(using: params)
-        // Note: no Bonjour service type — advertising to the (nonexistent,
+        // No Bonjour service type — advertising to the (nonexistent,
         // sandboxed) Bonjour daemon can fail the bind on hardened builds
         // and the player only ever dials 127.0.0.1 directly.
-        listener?.newConnectionHandler = { [weak self] conn in
+        listener = try? NWListener(using: params)
+        guard let l = listener else {
+            lastDiagnostic = "【proxy】NWListener 创建失败，代理未启动"
+            return
+        }
+        l.newConnectionHandler = { [weak self] conn in
             self?.handle(conn: conn)
         }
-        listener?.stateUpdateHandler = { [weak self] state in
-            if case .ready = state {
+        l.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
                 if let port = self?.listener?.port?.rawValue {
                     self?.portLock.lock()
                     self?._port = port
                     self?.portLock.unlock()
                 }
+                self?.lastDiagnostic = "【proxy】监听就绪 port=\(self?.listener?.port?.rawValue ?? 0)"
+            case .failed(let err):
+                self?.listenerFailed = "NWListener 绑定失败: \(err)"
+                self?.lastDiagnostic = "【proxy】NWListener 绑定失败: \(err)"
+            case .waiting(let err):
+                self?.lastDiagnostic = "【proxy】NWListener 等待: \(err)"
+            case .cancelled:
+                break
+            case .setup:
+                break
+            @unknown default:
+                break
             }
         }
-        listener?.start(queue: queue)
+        l.start(queue: queue)
+    }
+
+    /// After the listener reports ready, prove the loopback proxy serves
+    /// before AVPlayer ever sees the URL. A 200 + #EXTM3U body is required;
+    /// anything else is reported as a loopback proxy failure (not a CDN
+    /// failure) so an unreachable on-device proxy is distinguishable.
+    public func selfCheck(playlistProxyURL: String) async throws {
+        if let failed = listenerFailed {
+            throw PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
+                httpStatus: nil, code: nil, domain: nil,
+                message: "代理监听失败: \(failed)")
+        }
+        guard isReady, let url = URL(string: playlistProxyURL) else {
+            throw PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
+                httpStatus: nil, code: nil, domain: nil,
+                message: "代理未就绪（port=\(port)）")
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 10
+        let (data, resp): (Data, URLResponse)
+        do {
+            let c = URLSessionConfiguration.default
+            c.timeoutIntervalForRequest = 10
+            c.timeoutIntervalForResource = 10
+            (data, resp) = try await URLSession(configuration: c).data(for: req)
+        } catch {
+            let ns = error as NSError
+            throw PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
+                httpStatus: nil, code: ns.code, domain: ns.domain,
+                message: "代理自检请求失败（loopback 不可达）: \(error.localizedDescription)")
+        }
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let head = String(data: data.prefix(8), encoding: .utf8) ?? ""
+        guard code == 200, head.hasPrefix("#EXTM3U") else {
+            throw PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
+                httpStatus: code, code: code, domain: "HTTP",
+                message: "代理自检未返回播放列表 (http=\(code), body=\(data.count) bytes, head=\(head))")
+        }
+        lastDiagnostic = "【proxy】自检通过 port=\(port) bytes=\(data.count)"
     }
 
     // --- connection handling ---
@@ -125,7 +258,18 @@ public final class HLSProxy: NSObject, ObservableObject {
     /// URLs, Range/Cookie headers). Loop until the header terminator
     /// arrives instead of failing on a truncated request line.
     private func receive(conn: NWConnection, buffer: Data) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, _ in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, ctx, isComplete, error in
+            if let error {
+                // Peer closed / reset mid-request: stop recursing. The old
+                // code ignored isComplete/error and re-issued receive
+                // forever on a dead connection.
+                conn.cancel()
+                return
+            }
+            if isComplete, data == nil {
+                conn.cancel()
+                return
+            }
             var buffer = buffer
             if let data {
                 buffer.append(data)
@@ -140,6 +284,10 @@ public final class HLSProxy: NSObject, ObservableObject {
                 return
             }
             if buffer.count > 262144 {
+                conn.cancel()
+                return
+            }
+            if isComplete {
                 conn.cancel()
                 return
             }
@@ -174,14 +322,16 @@ public final class HLSProxy: NSObject, ObservableObject {
                 let (mime, data) = try await CoverLoader.shared.loadImage(url: target)
                 respond(conn, status: 200, body: data, contentType: mime, cache: "public, max-age=86400")
             } catch {
-                respond(conn, status: 502, body: (error.localizedDescription).data(using: .utf8)!, contentType: "text/plain", cache: "no-store")
+                recordFailure(error, step: "img", host: hostOf(target))
+                respond502(conn: conn, error: error, step: "img", host: hostOf(target))
             }
         case "/hls":
             do {
                 let text = try await loadPlaylist(url: target)
                 respond(conn, status: 200, body: Data(text.utf8), contentType: "application/vnd.apple.mpegurl", cache: "no-store")
             } catch {
-                respond(conn, status: 502, body: (error.localizedDescription).data(using: .utf8)!, contentType: "text/plain", cache: "no-store")
+                recordFailure(error, step: "playlist", host: hostOf(target))
+                respond502(conn: conn, error: error, step: "playlist", host: hostOf(target))
             }
         case "/seg":
             do {
@@ -197,7 +347,8 @@ public final class HLSProxy: NSObject, ObservableObject {
                     respond(conn, status: 200, body: data, contentType: mime ?? "application/octet-stream", cache: "public, max-age=3600")
                 }
             } catch {
-                respond(conn, status: 502, body: (error.localizedDescription).data(using: .utf8)!, contentType: "text/plain", cache: "no-store")
+                recordFailure(error, step: "segment", host: hostOf(target))
+                respond502(conn: conn, error: error, step: "segment", host: hostOf(target))
             }
         default:
             respond(conn, status: 404, body: Data("not found".utf8), contentType: "text/plain", cache: "no-store")
@@ -212,6 +363,19 @@ public final class HLSProxy: NSObject, ObservableObject {
         return ""
     }
 
+    private func recordFailure(_ error: Error, step: String, host: String) {
+        lastDiagnostic = diagnoseFailure(error, step: step, host: host).diagnosticString()
+    }
+
+    /// 502 body carries the structured diagnostic so AVPlayer's item.error
+    /// (and our self-check) can name the failing host instead of a bare
+    /// "HTTP 502".
+    private func respond502(conn: NWConnection, error: Error, step: String, host: String) {
+        let diag = diagnoseFailure(error, step: step, host: host)
+        respond(conn, status: 502, body: Data(diag.diagnosticString().utf8),
+                contentType: "text/plain", cache: "no-store")
+    }
+
     private func loadPlaylist(url: String) async throws -> String {
         if let hit = plCache.object(forKey: url as NSString),
            let when = plCacheDates.object(forKey: url as NSString),
@@ -220,10 +384,14 @@ public final class HLSProxy: NSObject, ObservableObject {
         }
         let (_, data) = try await fetcher.fetch(url)
         guard let text = String(data: data, encoding: .utf8) else {
-            throw APIError.network("播放列表不是 UTF-8 文本")
+            throw PlaybackDiagnostic(step: "playlist", host: hostOf(url),
+                httpStatus: nil, code: nil, domain: nil, message: "播放列表不是 UTF-8 文本")
         }
         let cleaned = text.hasPrefix("\u{feff}") ? String(text.dropFirst()) : text
-        guard cleaned.hasPrefix("#EXTM3U") else { throw APIError.network("响应不是 HLS 播放列表") }
+        guard cleaned.hasPrefix("#EXTM3U") else {
+            throw PlaybackDiagnostic(step: "playlist", host: hostOf(url),
+                httpStatus: nil, code: nil, domain: nil, message: "响应不是 HLS 播放列表")
+        }
         let rewritten = rewritePlaylist(baseURL: url, text: cleaned, prefix: base)
         if plCache.countLimit == 0 { plCache.countLimit = 60 }
         plCache.setObject(rewritten as NSString, forKey: url as NSString)
