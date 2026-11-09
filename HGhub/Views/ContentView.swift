@@ -347,7 +347,7 @@ final class PlayerContainerView: UIView {
     private var spinner: UIActivityIndicatorView!
     private var label: UILabel!
 
-    override class var layerClass: Class { AVPlayerLayer.self }
+    override class var layerClass: AnyClass { AVPlayerLayer.self }
 
     var videoLayer: AVPlayerLayer { layer as! AVPlayerLayer }
 
@@ -599,7 +599,7 @@ struct CoverPlayerView: UIViewRepresentable {
                 container?.hidePoster()
                 container?.setLoading(false)
                 container?.setMessage(nil)
-            } else if p.timeControlStatus == .waitingToPlayNonZeroRate, p.rate != 0 {
+            } else if p.timeControlStatus == .waitingToPlayAtSpecifiedRate, p.rate != 0 {
                 container?.setLoading(true)
             } else {
                 container?.setLoading(false)
