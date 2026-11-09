@@ -444,6 +444,7 @@ struct CoverPlayerView: UIViewRepresentable {
         private var userPaused = false
         private var posterCover: String?
         private var posterTask: Task<Void, Never>?
+        private var watchdogTimer: Timer?
         private var timeControlObs: NSKeyValueObservation?
         private var currentItemObs: NSKeyValueObservation?
         private var itemStatusObs: NSKeyValueObservation?
@@ -480,6 +481,8 @@ struct CoverPlayerView: UIViewRepresentable {
         func teardown() {
             historyTimer?.invalidate()
             historyTimer = nil
+            watchdogTimer?.invalidate()
+            watchdogTimer = nil
             removeObservers()
             player?.pause()
             player = nil
@@ -502,6 +505,8 @@ struct CoverPlayerView: UIViewRepresentable {
 
         private func rebuildPlayer(url: String?) {
             removeObservers()
+            watchdogTimer?.invalidate()
+            watchdogTimer = nil
             player?.pause()
             player = nil
             container?.videoLayer.player = nil
@@ -523,6 +528,37 @@ struct CoverPlayerView: UIViewRepresentable {
                 p.pause()
             }
             startHistoryTimer()
+            startWatchdog()
+        }
+
+        /// Stall watchdog: AVPlayer can sit in `.unknown` / waiting forever
+        /// without ever reaching `.readyToPlay` or `.failed` (e.g. an
+        /// unparseable playlist). Fires once, 15s after the player starts,
+        /// and only if playback is expected (active + user has not paused)
+        /// but still has not progressed. Surfaces through onError →
+        /// FeedPage's "视频暂时无法加载" + retry UI.
+        private static let stallWatchSeconds: TimeInterval = 15
+
+        private func startWatchdog() {
+            watchdogTimer?.invalidate()
+            watchdogTimer = Timer.scheduledTimer(withTimeInterval: Self.stallWatchSeconds, repeats: false) { [weak self] _ in
+                DispatchQueue.main.async { self?.checkStall() }
+            }
+        }
+
+        private func checkStall() {
+            watchdogTimer = nil
+            guard let p = player, active, !userPaused else { return }
+            let item = p.currentItem
+            let itemReady = item?.status == .readyToPlay
+            let hasProgressed = p.rate != 0 && p.timeControlStatus == .playing
+                || (p.currentTime().seconds.isFinite && p.currentTime().seconds > 0)
+            let waiting = p.timeControlStatus == .waitingToPlayAtSpecifiedRate && p.rate != 0
+            if !itemReady && !hasProgressed {
+                handleFailure("视频加载超时（15 秒），请检查网络后重试")
+            } else if waiting && !hasProgressed {
+                handleFailure("视频加载超时（15 秒），请检查网络后重试")
+            }
         }
 
         private func playInternal() {
@@ -581,6 +617,9 @@ struct CoverPlayerView: UIViewRepresentable {
         private func handleItemStatus(_ item: AVPlayerItem) {
             switch item.status {
             case .readyToPlay:
+                // The item is good; the watchdog has served its purpose.
+                watchdogTimer?.invalidate()
+                watchdogTimer = nil
                 container?.setLoading(false)
                 container?.setMessage(nil)
             case .failed:
@@ -608,6 +647,8 @@ struct CoverPlayerView: UIViewRepresentable {
         }
 
         private func handleFailure(_ message: String) {
+            watchdogTimer?.invalidate()
+            watchdogTimer = nil
             player?.pause()
             container?.setLoading(false)
             container?.setMessage(nil)
