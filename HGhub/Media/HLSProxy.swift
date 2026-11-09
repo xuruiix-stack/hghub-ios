@@ -137,18 +137,70 @@ public final class HLSProxy: NSObject, ObservableObject {
         return _port
     }
 
-    public var isReady: Bool { port != 0 }
+    /// True only while the listener is actually bound and accepting.
+    /// `port != 0` alone was a lie: `_port` is only ever set on `.ready`
+    /// and never cleared, so after a network-path flap (`.waiting`), a
+    /// system teardown (`.cancelled`) or a bind failure the flag stayed
+    /// true while the socket was dead, and the self-check dialed a dead
+    /// port and got a spurious -1004 (loopback unreachable). The flag now
+    /// also requires the tracked listener state to be `.ready`.
+    public var isReady: Bool {
+        guard port != 0 else { return false }
+        stateLock.lock()
+        let ready = listenerStateIsReady
+        stateLock.unlock()
+        return ready
+    }
 
     public var base: String {
         "http://127.0.0.1:\(port)"
     }
 
-    private(set) var lastDiagnostic: String?
-    private(set) var listenerFailed: String?
+    private(set) var lastDiagnostic: String? {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _lastDiagnostic }
+        set { stateLock.lock(); _lastDiagnostic = newValue; stateLock.unlock() }
+    }
+    private var _lastDiagnostic: String?
+    private(set) var listenerFailed: String? {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _listenerFailed }
+        set { stateLock.lock(); _listenerFailed = newValue; stateLock.unlock() }
+    }
+    private var _listenerFailed: String?
+
+    /// Truthful mirror of the current NWListener.State, guarded by
+    /// stateLock. A listener in `.setup` / `.waiting` / `.failed` /
+    /// `.cancelled` is NOT accepting connections, so `isReady` and
+    /// `waitUntilReady` must never treat it as live.
+    private let stateLock = NSLock()
+    private var listenerStateIsReady = false
+    /// Identifies the instance `listener` currently points at. State
+    /// updates carry the generation they were installed with, so a late
+    /// `.cancelled` from a superseded listener (it fires after a newer
+    /// listener has already become `.ready`) cannot clear the port or
+    /// trigger a restart of a healthy listener.
+    private var listenerGeneration = 0
+    /// Bounded restart bookkeeping: how many consecutive restarts have been
+    /// scheduled since the listener last reached `.ready`, and the earliest
+    /// date the next auto-restart may begin.
+    private var restartAttempts = 0
+    private var restartNotBefore = Date.distantPast
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "hg.hlsproxy", qos: .utility)
     private let fetcher: ByteFetcher
+    /// One shared self-check session. Force a DIRECT loopback connection:
+    /// `connectionProxyDictionary = [:]` bypasses any system-wide HTTP
+    /// proxy, which would otherwise divert the 127.0.0.1 request and
+    /// produce a spurious -1004. Reused across calls instead of minting a
+    /// fresh session (and its connection pool) per self-check.
+    private let selfCheckSession: URLSession = {
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 10
+        c.timeoutIntervalForResource = 10
+        c.connectionProxyDictionary = [:]
+        c.urlCache = nil
+        return URLSession(configuration: c)
+    }()
     private let plCache = NSCache<NSString, NSString>()
     private let plCacheDates = NSCache<NSString, NSDate>()
     private let plCacheTTL: TimeInterval = 10 * 60
@@ -159,14 +211,54 @@ public final class HLSProxy: NSObject, ObservableObject {
         start()
     }
 
-    /// Suspends until the listener is bound (or gives up after 5s). The
-    /// playback path awaits this before building any proxy URL — the old
-    /// code read `base` synchronously right after `start()`, so a slow
-    /// bind produced `http://127.0.0.1:0/...` URLs and a black player.
+    /// Suspends until the listener is truly bound AND accepting (up to
+    /// ~8s). If it is not ready, (re)starts it and keeps waiting — a
+    /// flapped / torn-down listener heals here instead of handing
+    /// AVPlayer a dead port. The playback path awaits this before
+    /// building any proxy URL — the old code read `base` synchronously
+    /// right after `start()`, so a slow bind produced
+    /// `http://127.0.0.1:0/...` URLs and a black player.
     public func waitUntilReady() async {
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(8)
         while !isReady && Date() < deadline {
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            ensureRunning()
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    /// (Re)starts the listener when it is not in `.ready` state. Safe to
+    /// call from any thread and any number of times: it no-ops when the
+    /// listener is already starting or ready.
+    public func ensureRunning() {
+        stateLock.lock()
+        let ready = listenerStateIsReady
+        let starting = listener != nil && !ready && restartNotBefore <= Date()
+        stateLock.unlock()
+        guard !ready, !starting else { return }
+        start()
+    }
+
+    /// Schedule an automatic restart after a failed / cancelled
+    /// transition, with bounded retries and growing backoff (max ~5
+    /// consecutive attempts) so a restart loop can never spin forever.
+    /// `restartAttempts` resets to 0 each time the listener reaches
+    /// `.ready`.
+    private func scheduleRestart() {
+        stateLock.lock()
+        let attempts = restartAttempts
+        guard attempts < 5 else {
+            let msg = "【proxy】监听重启已达上限（5 次），停止自动重启"
+            stateLock.unlock()
+            lastDiagnostic = msg
+            return
+        }
+        let delay = min(0.5 * Double(1 << attempts), 5.0)  // 0.5s, 1s, 2s, 4s, 5s
+        restartAttempts = attempts + 1
+        restartNotBefore = Date().addingTimeInterval(delay)
+        stateLock.unlock()
+        lastDiagnostic = "【proxy】监听异常，计划第 \(attempts + 1) 次重启（延迟 \(delay)s）"
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.start()
         }
     }
 
@@ -175,34 +267,95 @@ public final class HLSProxy: NSObject, ObservableObject {
         // No Bonjour service type — advertising to the (nonexistent,
         // sandboxed) Bonjour daemon can fail the bind on hardened builds
         // and the player only ever dials 127.0.0.1 directly.
-        listener = try? NWListener(using: params)
-        guard let l = listener else {
+        guard let l = try? NWListener(using: params) else {
+            listenerFailed = "NWListener 创建失败"
             lastDiagnostic = "【proxy】NWListener 创建失败，代理未启动"
+            scheduleRestart()
             return
         }
-        l.newConnectionHandler = { [weak self] conn in
-            self?.handle(conn: conn)
-        }
-        l.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                if let port = self?.listener?.port?.rawValue {
-                    self?.portLock.lock()
-                    self?._port = port
-                    self?.portLock.unlock()
+        queue.sync {
+            self.listener?.cancel()
+            stateLock.lock()
+            listenerGeneration += 1
+            let gen = listenerGeneration
+            listenerStateIsReady = false
+            listener = l
+            stateLock.unlock()
+            portLock.lock()
+            _port = 0
+            portLock.unlock()
+            l.newConnectionHandler = { [weak self] conn in
+                self?.handle(conn: conn)
+            }
+            l.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                // Ignore transitions from a superseded listener instance.
+                self.stateLock.lock()
+                let current = self.listenerGeneration
+                self.stateLock.unlock()
+                guard gen == current else { return }
+                switch state {
+                case .ready:
+                    if let boundPort = l.port?.rawValue, boundPort != 0 {
+                        self.portLock.lock()
+                        self._port = boundPort
+                        self.portLock.unlock()
+                    }
+                    self.stateLock.lock()
+                    self.listenerStateIsReady = true
+                    self.restartAttempts = 0
+                    self.restartNotBefore = .distantPast
+                    self._listenerFailed = nil
+                    self.stateLock.unlock()
+                    self.lastDiagnostic = "【proxy】监听就绪 port=\(self.port) state=ready"
+                case .failed(let err):
+                    self.portLock.lock()
+                    self._port = 0
+                    self.portLock.unlock()
+                    self.stateLock.lock()
+                    self.listenerStateIsReady = false
+                    self.stateLock.unlock()
+                    self.listenerFailed = "NWListener 绑定失败: \(err)"
+                    self.lastDiagnostic = "【proxy】监听失败 state=failed: \(err)"
+                    self.scheduleRestart()
+                case .cancelled:
+                    // A deliberate teardown (e.g. superseded by a fresh
+                    // listener from start()) lands here too. Clear the
+                    // port — the socket is gone — but only restart if
+                    // this instance is still the current one; a fresh
+                    // start() already replaced it, and the generation
+                    // check above drops superseded updates before they
+                    // get here.
+                    self.portLock.lock()
+                    self._port = 0
+                    self.portLock.unlock()
+                    self.stateLock.lock()
+                    self.listenerStateIsReady = false
+                    self.stateLock.unlock()
+                    self.lastDiagnostic = "【proxy】监听已取消 state=cancelled"
+                    self.scheduleRestart()
+                case .waiting(let err):
+                    // Network-path flap: not accepting right now, but it
+                    // may recover to .ready on its own. Clear readiness
+                    // so callers never trust the stale port, but do not
+                    // restart — .ready will follow.
+                    self.portLock.lock()
+                    self._port = 0
+                    self.portLock.unlock()
+                    self.stateLock.lock()
+                    self.listenerStateIsReady = false
+                    self.stateLock.unlock()
+                    self.lastDiagnostic = "【proxy】监听等待 state=waiting: \(err)"
+                case .setup:
+                    self.portLock.lock()
+                    self._port = 0
+                    self.portLock.unlock()
+                    self.stateLock.lock()
+                    self.listenerStateIsReady = false
+                    self.stateLock.unlock()
+                @unknown default:
+                    break
                 }
-                self?.lastDiagnostic = "【proxy】监听就绪 port=\(self?.listener?.port?.rawValue ?? 0)"
-            case .failed(let err):
-                self?.listenerFailed = "NWListener 绑定失败: \(err)"
-                self?.lastDiagnostic = "【proxy】NWListener 绑定失败: \(err)"
-            case .waiting(let err):
-                self?.lastDiagnostic = "【proxy】NWListener 等待: \(err)"
-            case .cancelled:
-                break
-            case .setup:
-                break
-            @unknown default:
-                break
             }
         }
         l.start(queue: queue)
@@ -212,13 +365,47 @@ public final class HLSProxy: NSObject, ObservableObject {
     /// before AVPlayer ever sees the URL. A 200 + #EXTM3U body is required;
     /// anything else is reported as a loopback proxy failure (not a CDN
     /// failure) so an unreachable on-device proxy is distinguishable.
+    ///
+    /// Up to 3 attempts with short backoff (300ms, then 800ms). Before
+    /// each attempt the listener is (re)started if needed and awaited, so
+    /// a loopback connect failure (-1004) triggers a restart and a retry
+    /// instead of failing the video on a transient flap.
     public func selfCheck(playlistProxyURL: String) async throws {
-        if let failed = listenerFailed {
-            throw PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
-                httpStatus: nil, code: nil, domain: nil,
-                message: "代理监听失败: \(failed)")
+        var lastError: PlaybackDiagnostic?
+        let backoffs: [UInt64] = [300_000_000, 800_000_000]
+        for attempt in 0..<3 {
+            ensureRunning()
+            if let failed = listenerFailed, !isReady {
+                lastError = PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
+                    httpStatus: nil, code: nil, domain: nil,
+                    message: "代理监听失败: \(failed)")
+            } else if let url = URL(string: playlistProxyURL) {
+                do {
+                    try await selfCheckOnce(url: url)
+                    return
+                } catch let d as PlaybackDiagnostic {
+                    lastError = d
+                    // Loopback connect failure means the listener flapped
+                    // after we read the port; heal it before retrying.
+                    if d.step == "proxy" { ensureRunning() }
+                }
+            } else {
+                lastError = PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
+                    httpStatus: nil, code: nil, domain: nil,
+                    message: "代理未就绪（port=\(port)）")
+            }
+            if attempt < 2 {
+                await waitUntilReady()
+                try? await Task.sleep(nanoseconds: backoffs[attempt])
+            }
         }
-        guard isReady, let url = URL(string: playlistProxyURL) else {
+        throw lastError ?? PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
+            httpStatus: nil, code: nil, domain: nil,
+            message: "代理自检失败")
+    }
+
+    private func selfCheckOnce(url: URL) async throws {
+        guard isReady else {
             throw PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
                 httpStatus: nil, code: nil, domain: nil,
                 message: "代理未就绪（port=\(port)）")
@@ -227,10 +414,7 @@ public final class HLSProxy: NSObject, ObservableObject {
         req.timeoutInterval = 10
         let (data, resp): (Data, URLResponse)
         do {
-            let c = URLSessionConfiguration.default
-            c.timeoutIntervalForRequest = 10
-            c.timeoutIntervalForResource = 10
-            (data, resp) = try await URLSession(configuration: c).data(for: req)
+            (data, resp) = try await selfCheckSession.data(for: req)
         } catch {
             let ns = error as NSError
             throw PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
