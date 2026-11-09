@@ -319,14 +319,37 @@ struct FeedPage: View {
         do {
             let info = try await api.play(id: card.id, ep: currentEp)
             guard !info.video_url.isEmpty else { throw APIError.network("暂无播放地址") }
+            let upstreamHost = hostOf(info.video_url)
             await HLSProxy.shared.waitUntilReady()
             guard HLSProxy.shared.isReady else {
-                throw APIError.network("本地代理未就绪，请重试")
+                throw PlaybackDiagnostic(step: "proxy", host: "127.0.0.1",
+                    httpStatus: nil, code: nil, domain: nil,
+                    message: "本地代理未就绪，请重试（上游 \(upstreamHost)）")
             }
-            playURL = HGAUrl.playlist(info.video_url, proxy: HLSProxy.shared)
+            let proxyURL = HGAUrl.playlist(info.video_url, proxy: HLSProxy.shared)
+            // Prove the loopback proxy serves before AVPlayer ever sees
+            // the URL, so a dead proxy is reported as such (not as a CDN
+            // unreachable failure on the user's network).
+            do {
+                try await HLSProxy.shared.selfCheck(playlistProxyURL: proxyURL)
+            } catch {
+                if let d = error as? PlaybackDiagnostic {
+                    playError = "loopback 代理不可用：\(d.diagnosticString())（上游 \(upstreamHost)）"
+                } else {
+                    playError = "loopback 代理不可用：\(error.localizedDescription)（上游 \(upstreamHost)）"
+                }
+                return
+            }
+            playURL = proxyURL
             store.addHistory(card.id, ep: currentEp)
         } catch {
-            playError = error.localizedDescription
+            // api.play failure: preserve structured diagnostics when present,
+            // otherwise surface the API error verbatim (it names the step).
+            if let d = error as? PlaybackDiagnostic {
+                playError = d.diagnosticString()
+            } else {
+                playError = error.localizedDescription
+            }
         }
     }
 
@@ -554,11 +577,15 @@ struct CoverPlayerView: UIViewRepresentable {
             let hasProgressed = p.rate != 0 && p.timeControlStatus == .playing
                 || (p.currentTime().seconds.isFinite && p.currentTime().seconds > 0)
             let waiting = p.timeControlStatus == .waitingToPlayAtSpecifiedRate && p.rate != 0
-            if !itemReady && !hasProgressed {
-                handleFailure("视频加载超时（15 秒），请检查网络后重试")
-            } else if waiting && !hasProgressed {
-                handleFailure("视频加载超时（15 秒），请检查网络后重试")
-            }
+            let stall = (!itemReady && !hasProgressed) || (waiting && !hasProgressed)
+            guard stall else { return }
+            let urlStr = currentURL ?? ""
+            let host = upstreamHostOf(urlStr) ?? hostOf(urlStr)
+            let last = HLSProxy.shared.lastDiagnostic ?? ""
+            let msg = "视频加载超时（15 秒），请检查网络后重试"
+                + " host=\(host.isEmpty ? "127.0.0.1" : host)"
+                + (last.isEmpty ? "" : " proxy:\(last)")
+            handleFailure(msg)
         }
 
         private func playInternal() {
@@ -587,8 +614,10 @@ struct CoverPlayerView: UIViewRepresentable {
                 forName: AVPlayerItem.failedToPlayToEndTimeNotification,
                 object: nil, queue: .main
             ) { [weak self] note in
-                let msg = (note.object as? AVPlayerItem)?.error?.localizedDescription ?? "播放失败"
-                self?.handleFailure(msg)
+                guard let self else { return }
+                let item = note.object as? AVPlayerItem
+                let err = item?.error
+                self.handleFailure(self.diagnosticForItemError(err))
             }
         }
 
@@ -623,7 +652,7 @@ struct CoverPlayerView: UIViewRepresentable {
                 container?.setLoading(false)
                 container?.setMessage(nil)
             case .failed:
-                handleFailure(item.error?.localizedDescription ?? "播放失败")
+                handleFailure(diagnosticForItemError(item.error))
             case .unknown:
                 break
             @unknown default:
@@ -654,6 +683,25 @@ struct CoverPlayerView: UIViewRepresentable {
             container?.setMessage(nil)
             onPlayingChange?(false)
             onError?(message)
+        }
+
+        /// Structured AVPlayer item failure: NSError code + domain, which
+        /// step (item vs segment/key), the upstream host recovered from the
+        /// proxy URL, and the proxy's last recorded diagnostic. This is
+        /// what distinguishes "loopback proxy dead" from "CDN unreachable
+        /// from the user's network".
+        private func diagnosticForItemError(_ error: Error?) -> String {
+            let urlStr = currentURL ?? ""
+            let host = upstreamHostOf(urlStr) ?? hostOf(urlStr)
+            let last = HLSProxy.shared.lastDiagnostic ?? ""
+            guard let err = error as NSError? else {
+                return "播放失败 host=\(host.isEmpty ? "127.0.0.1" : host)" + (last.isEmpty ? "" : " proxy:\(last)")
+            }
+            let http = httpStatusFromMessage(err.localizedDescription)
+            let diag = PlaybackDiagnostic(step: "item", host: host.isEmpty ? "127.0.0.1" : host,
+                httpStatus: http, code: err.code, domain: err.domain,
+                message: err.localizedDescription)
+            return diag.diagnosticString() + (last.isEmpty ? "" : " proxy:\(last)")
         }
 
         private func loadPosterIfNeeded(card: VideoCard) {
