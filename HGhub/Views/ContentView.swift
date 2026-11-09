@@ -330,15 +330,23 @@ struct FeedPage: View {
             // Prove the loopback proxy serves before AVPlayer ever sees
             // the URL, so a dead proxy is reported as such (not as a CDN
             // unreachable failure on the user's network).
+            // One automatic retry of the whole load (~1s later) before
+            // surfacing the error, so a transient loopback flap does not
+            // fail the video. The manual retry button stays as-is.
             do {
                 try await HLSProxy.shared.selfCheck(playlistProxyURL: proxyURL)
             } catch {
-                if let d = error as? PlaybackDiagnostic {
-                    playError = "loopback 代理不可用：\(d.diagnosticString())（上游 \(upstreamHost)）"
-                } else {
-                    playError = "loopback 代理不可用：\(error.localizedDescription)（上游 \(upstreamHost)）"
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                do {
+                    try await HLSProxy.shared.selfCheck(playlistProxyURL: proxyURL)
+                } catch {
+                    if let d = error as? PlaybackDiagnostic {
+                        playError = "loopback 代理不可用：\(d.diagnosticString())（上游 \(upstreamHost)）"
+                    } else {
+                        playError = "loopback 代理不可用：\(error.localizedDescription)（上游 \(upstreamHost)）"
+                    }
+                    return
                 }
-                return
             }
             playURL = proxyURL
             store.addHistory(card.id, ep: currentEp)
