@@ -307,7 +307,7 @@ struct PlayerLayerHost: UIViewRepresentable {
 }
 
 final class PlayerLayerContainerView: UIView {
-    private var hostedLayer: CALayer?
+    var hostedLayer: CALayer?
 
     func host(_ layer: CALayer) {
         hostedLayer?.removeFromSuperlayer()

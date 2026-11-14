@@ -946,7 +946,7 @@ struct CoverPlayerView: UIViewRepresentable {
                     // Near-end auto-advance.
                     if !self.nearEndFired, dur > 5, t >= dur - 0.35 {
                         self.nearEndFired = true
-                        m.onNearEnd?()
+                        self.onNearEnd?()
                     }
                 }
             }
