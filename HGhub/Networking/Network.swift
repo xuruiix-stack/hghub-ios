@@ -436,17 +436,118 @@ public final class API: ObservableObject {
     public func posts(page: Int = 1, size: Int = 20) async throws -> Paged<Post> {
         try await get("/api/posts?page=\(page)&size=\(size)")
     }
-    public func post(id: Int) async throws -> PostDetail {
-        try await get("/api/posts/\(id)")
-    }
 
     // --- detail / play ---
 
     public func video(id: Int) async throws -> Detail {
         try await get("/api/videos/\(id)")
     }
+
+    /// v1.2.2: upstream switched playback auth to
+    /// POST /api/videos/{id}/episodes/{ep}/playback (streams.main/hevc/preview
+    /// + cdn block). Verified live on 2026-11-14: the legacy
+    /// GET /api/videos/{id}/play endpoint still answers 200 but now returns
+    /// an empty video_url, so it is only a fallback, never the primary.
+    /// Mirrors api.rs api_play: try the new endpoint first, fall back to the
+    /// legacy one only on failure, and normalize `streams` into the legacy
+    /// PlayInfo shape so downstream code keeps working unchanged.
     public func play(id: Int, ep: Int) async throws -> PlayInfo {
-        try await get("/api/videos/\(id)/play?ep=\(ep)&page_texts=0")
+        do {
+            let info: PlaybackInfo = try await playback(id: id, ep: ep)
+            return info.normalizedPlayInfo()
+        } catch {
+            // Legacy fallback: same shape as before the upstream change.
+            // An empty video_url surfaces downstream as "暂无播放地址",
+            // exactly like the old behavior when the CDN had nothing.
+            return try await get("/api/videos/\(id)/play?ep=\(ep)&page_texts=0")
+        }
+    }
+
+    /// Raw POST /api/videos/{id}/episodes/{ep}/playback response.
+    /// Mirrors normalize_video_playback in api.rs.
+    public struct PlaybackInfo: Decodable {
+        public var mode: Int?
+        public var timestamp: Int?
+        public var manifest_method: String?
+        public var cdn: CDNAuth?
+        public var id: String?
+        public var ep: Int?
+        public var media_id: String?
+        public var streams: Streams?
+        public var video_url: String?
+        public var video_url_hevc: String?
+        public var duration: Double?
+        public var title: String?
+
+        public struct CDNAuth: Decodable {
+            public var m3u8Enabled: Bool?
+            public var otherEnabled: Bool?
+            public var authKey: String?
+            public var authValue: String?
+            public var app: String?
+            public var imgEnabled: Bool?
+            public var imgAuthKey: String?
+            public var imgAuthValue: String?
+        }
+        public struct Streams: Decodable {
+            public var main: String?
+            public var hevc: String?
+            public var preview: String?
+        }
+
+        func normalizedPlayInfo() -> PlayInfo {
+            // pick_stream_url: main → hevc → preview (trimmed, non-empty).
+            let main = streams?.main?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let hevc = streams?.hevc?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let preview = streams?.preview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let url = !main.isEmpty ? main : (!hevc.isEmpty ? hevc : (!preview.isEmpty ? preview : ""))
+            let hevcURL = !hevc.isEmpty ? hevc : (video_url_hevc ?? "")
+            return PlayInfo(
+                id: Int(id ?? "") ?? 0,
+                ep_num: ep ?? 0,
+                duration: duration ?? 0,
+                title: title ?? "",
+                video_url: url,
+                video_url_hevc: hevcURL.isEmpty ? nil : hevcURL)
+        }
+    }
+
+    /// POST /api/videos/{id}/episodes/{ep}/playback with an empty JSON body.
+    /// Mirrors post_playback in api.rs: token attached when we have one, but
+    /// the endpoint also answers guest requests.
+    private func playback<T: Decodable>(id: Int, ep: Int) async throws -> T {
+        try await edge(method: "POST",
+                       path: "/api/videos/\(id)/episodes/\(ep)/playback",
+                       body: [:],
+                       token: session.token(for: base))
+    }
+
+    /// v1.2.2: POST /api/posts/{id}/playback returns the post's playable
+    /// video list; GET /api/posts/{id} now returns an empty video_url.
+    /// Mirrors normalize_post_playback in api.rs: keep the inline video_url
+    /// when present, otherwise backfill from videos[0].url or streams.
+    public func post(id: Int) async throws -> PostDetail {
+        let detail: PostDetail = try await get("/api/posts/\(id)")
+        guard detail.video_url == nil || detail.video_url?.isEmpty == true else { return detail }
+        struct PostPlayback: Decodable {
+            var videos: [PostVideo]?
+            var streams: PlaybackInfo.Streams?
+            var video_url: String?
+            struct PostVideo: Decodable { var index: Int?; var url: String? }
+        }
+        guard let pb: PostPlayback = try? await edge(method: "POST",
+                                                     path: "/api/posts/\(id)/playback",
+                                                     body: [:],
+                                                     token: session.token(for: base)) else {
+            return detail
+        }
+        var fixed = detail
+        let fromVideos = pb.videos?.first?.url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let main = pb.streams?.main?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let inline = pb.video_url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let url = !fromVideos.isEmpty ? fromVideos : (!main.isEmpty ? main : inline)
+        if !url.isEmpty { fixed.video_url = url }
+        return fixed
     }
 
     // --- comments / interaction ---
@@ -529,7 +630,8 @@ public final class API: ObservableObject {
     }
 
     public func lineProbe(urls: [String]) async -> [LineProbe] {
-        // Concurrency groups of 6, mirrors lines.rs probe.
+        // Concurrency groups of 6 with an 8s per-probe timeout,
+        // mirrors lines.rs probe (PROBE_TIMEOUT = 8s).
         var out: [LineProbe] = []
         for chunk in urls.chunked(into: 6) {
             await withTaskGroup(of: LineProbe.self) { group in
@@ -548,7 +650,9 @@ public final class API: ObservableObject {
             return LineProbe(url: url, ok: false, status: nil, ms: 0, error: "invalid url")
         }
         do {
-            let (_, resp) = try await urlSession.data(from: u)
+            var req = URLRequest(url: u)
+            req.timeoutInterval = 8
+            let (_, resp) = try await urlSession.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             return LineProbe(url: url, ok: code < 400, status: code,
                              ms: Int(Date().timeIntervalSince(start) * 1000), error: nil)

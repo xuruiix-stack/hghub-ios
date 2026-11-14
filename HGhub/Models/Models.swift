@@ -109,6 +109,16 @@ public struct PlayInfo: Decodable {
     public var title: String
     public var video_url: String
     public var video_url_hevc: String?
+
+    public init(id: Int, ep_num: Int, duration: Double, title: String,
+                video_url: String, video_url_hevc: String?) {
+        self.id = id
+        self.ep_num = ep_num
+        self.duration = duration
+        self.title = title
+        self.video_url = video_url
+        self.video_url_hevc = video_url_hevc
+    }
 }
 
 public struct RankItem: Decodable, Identifiable {
@@ -216,6 +226,24 @@ public struct PostDetail: Decodable {
     public var counts: PostCounts?
     public var created_at: String?
     public var publish_time: String?
+
+    public init(id: Int, title: String, desc: String?, content: String?, cover: String,
+                tags: [String], hot: Int, video_url: String?, video_id: Int?,
+                author: PostAuthor?, counts: PostCounts?, created_at: String?, publish_time: String?) {
+        self.id = id
+        self.title = title
+        self.desc = desc
+        self.content = content
+        self.cover = cover
+        self.tags = tags
+        self.hot = hot
+        self.video_url = video_url
+        self.video_id = video_id
+        self.author = author
+        self.counts = counts
+        self.created_at = created_at
+        self.publish_time = publish_time
+    }
 }
 
 public struct User: Codable {

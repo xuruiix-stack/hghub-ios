@@ -203,8 +203,17 @@ struct FeedPage: View {
     @State private var playError: String?
     @State private var isPlaying = false
     @State private var loadedKey = ""
+    // v1.2.0 player features (see PlayerFeatures.swift)
+    @StateObject private var gesture = PlayerGestureModel()
+    @State private var fullscreen = false
+    @State private var systemLandscape = false
 
     private var currentEp: Int { epMap[card.id] ?? 1 }
+
+    /// Next episode by ep_num (mirrors Feed.tsx onEnded → pickEp).
+    private var nextEpisode: Episode? {
+        detail?.episodes.first { $0.ep_num == currentEp + 1 }
+    }
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -214,18 +223,22 @@ struct FeedPage: View {
                 urlString: playURL,
                 muted: store.muted,
                 volume: store.volume,
+                gestureModel: isActive ? gesture : nil,
                 isPlaying: $isPlaying,
                 errorMsg: $playError,
                 onProgress: { t, dur in
                     store.addHistory(card.id, ep: currentEp, t: t, dur: dur)
-                }
+                },
+                onNearEnd: { autoAdvanceIfPossible() },
+                onEnded: { autoAdvanceIfPossible() }
             )
             if playLoading, playURL == nil {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .allowsHitTesting(false)
             }
-            if playURL != nil, playError == nil, !playLoading, !isPlaying {
+            if playURL != nil, playError == nil, !playLoading, !isPlaying,
+               gesture.cleanMode == false {
                 ZStack {
                     Circle()
                         .fill(Color.black.opacity(0.45))
@@ -255,48 +268,77 @@ struct FeedPage: View {
                 .background(Color.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            VStack(alignment: .leading, spacing: 8) {
-                if let d = detail {
-                    Text(d.title).font(.headline).foregroundStyle(.white)
-                    if d.is_finished { Text("已完结").font(.caption).foregroundStyle(.white.opacity(0.8)) }
-                } else {
-                    Text(card.title).font(.headline).foregroundStyle(.white)
+            // cleanMode hides every chrome overlay (single tap toggles).
+            Group {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let d = detail {
+                        Text(d.title).font(.headline).foregroundStyle(.white)
+                        if d.is_finished { Text("已完结").font(.caption).foregroundStyle(.white.opacity(0.8)) }
+                    } else {
+                        Text(card.title).font(.headline).foregroundStyle(.white)
+                    }
+                    Text("集数 \(card.episode_count) · 评分 \(card.score, specifier: "%.1f")")
+                        .font(.caption).foregroundStyle(.white.opacity(0.85))
+                    // v1.2.0: draggable progress bar (portrait, above tab bar).
+                    PlayerProgressBar(model: gesture)
+                        .frame(height: 26)
                 }
-                Text("集数 \(card.episode_count) · 评分 \(card.score, specifier: "%.1f")")
-                    .font(.caption).foregroundStyle(.white.opacity(0.85))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 16)
+                .padding(.trailing, 16)
+                .padding(.bottom, 90)
+                .background(
+                    LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .top, endPoint: .bottom)
+                )
+                VStack(spacing: 18) {
+                    Button { Task { await toggleLike() } } label: {
+                        VStack(spacing: 2) {
+                            Image(systemName: store.isLiked(card.id) ? "heart.fill" : "heart")
+                            Text(fmt(card.like_count)).font(.caption)
+                        }
+                    }
+                    Button { Task { await toggleCollect() } } label: {
+                        VStack(spacing: 2) {
+                            Image(systemName: store.isFav(card.id) ? "star.fill" : "star")
+                            Text(fmt(card.collect_count)).font(.caption)
+                        }
+                    }
+                    Button { requestComments(card.id) } label: {
+                        VStack(spacing: 2) {
+                            Image(systemName: "message")
+                            Text(fmt(card.comment_count)).font(.caption)
+                        }
+                    }
+                    Button { requestEpisodes(detail, card, currentEp) } label: {
+                        Image(systemName: "list.bullet")
+                    }
+                    // v1.2.0: playback lock + fullscreen entry.
+                    Button { gesture.controlsLocked = true } label: {
+                        Image(systemName: "lock")
+                    }
+                    .accessibilityLabel("锁定播放控制")
+                    Button { enterFullscreen() } label: {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    }
+                    .accessibilityLabel("横屏全屏")
+                }
+                .foregroundStyle(.white)
+                .padding(.trailing, 12)
+                .padding(.bottom, 100)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, 16)
-            .padding(.bottom, 90)
-            .background(
-                LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .top, endPoint: .bottom)
-            )
-            VStack(spacing: 18) {
-                Button { Task { await toggleLike() } } label: {
-                    VStack(spacing: 2) {
-                        Image(systemName: store.isLiked(card.id) ? "heart.fill" : "heart")
-                        Text(fmt(card.like_count)).font(.caption)
-                    }
-                }
-                Button { Task { await toggleCollect() } } label: {
-                    VStack(spacing: 2) {
-                        Image(systemName: store.isFav(card.id) ? "star.fill" : "star")
-                        Text(fmt(card.collect_count)).font(.caption)
-                    }
-                }
-                Button { requestComments(card.id) } label: {
-                    VStack(spacing: 2) {
-                        Image(systemName: "message")
-                        Text(fmt(card.comment_count)).font(.caption)
-                    }
-                }
-                Button { requestEpisodes(detail, card, currentEp) } label: {
-                    Image(systemName: "list.bullet")
-                }
+            .opacity(gesture.cleanMode ? 0 : 1)
+        }
+        .overlay {
+            if gesture.controlsLocked {
+                PlaybackLockOverlay { gesture.controlsLocked = false }
             }
-            .foregroundStyle(.white)
-            .padding(.trailing, 12)
-            .padding(.bottom, 100)
+        }
+        .overlay {
+            if fullscreen {
+                FullscreenPlayerOverlay(model: gesture) { exitFullscreen() }
+                    .transition(.move(edge: .bottom))
+                    .zIndex(10)
+            }
         }
         .task {
             detail = try? await api.video(id: card.id)
@@ -305,8 +347,52 @@ struct FeedPage: View {
         .onChange(of: currentEp) { _ in
             playURL = nil
             playError = nil
+            gesture.resetForNewMedia()
             Task { await loadPlayInfo() }
         }
+        .onChange(of: systemLandscape) { landscape in
+            // Physical rotation drives fullscreen both ways (mirrors
+            // Feed.tsx viewport-change listener).
+            guard isActive else { return }
+            if landscape { enterFullscreen() } else if fullscreen { exitFullscreen() }
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIDevice.orientationDidChangeNotification)) { _ in
+            // Track the *interface* orientation: when the system honors our
+            // requestGeometryUpdate the device notification also fires, and
+            // interface orientation is the truth used by Feed.tsx's
+            // innerWidth > innerHeight check.
+            let landscape = OrientationController.isDeviceLandscape
+            if landscape != systemLandscape {
+                systemLandscape = landscape
+            }
+        }
+        .onAppear {
+            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        }
+    }
+
+    // MARK: v1.2.0 fullscreen entry points
+
+    private func enterFullscreen() {
+        fullscreen = true
+        gesture.cleanMode = false
+        OrientationController.requestLandscape(true)
+    }
+
+    private func exitFullscreen() {
+        fullscreen = false
+        OrientationController.requestLandscape(false)
+    }
+
+    /// Auto-advance to the next episode (mirrors Feed.tsx onEnded handler).
+    /// Near-end fires ~0.35s early because some HLS containers report a
+    /// duration slightly longer than the last segment (see VideoSurface.tsx).
+    private func autoAdvanceIfPossible() {
+        guard isActive, playError == nil else { return }
+        guard let next = nextEpisode else { return }
+        epMap[card.id] = next.ep_num
+        // onChange(of: currentEp) reloads play info.
     }
 
     func loadPlayInfo() async {
@@ -442,16 +528,27 @@ struct CoverPlayerView: UIViewRepresentable {
     var urlString: String?
     var muted: Bool
     var volume: Double
+    /// v1.2.0 gesture bridge; nil disables gestures (inactive pages).
+    var gestureModel: PlayerGestureModel?
     @Binding var isPlaying: Bool
     @Binding var errorMsg: String?
     var onProgress: (Double, Double) -> Void
+    /// Fires ~0.35s before the true end (HLS duration overhang) so the
+    /// next-episode switch happens without a stalled last frame.
+    var onNearEnd: (() -> Void)?
+    /// Fires on AVPlayerItem.didPlayToEndTime.
+    var onEnded: (() -> Void)?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> PlayerContainerView {
         let container = PlayerContainerView(frame: .zero)
-        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.toggle))
-        container.addGestureRecognizer(tap)
+        // v1.2.0: single tap toggles play only when no gesture model is
+        // attached (gesture model owns tap/double-tap semantics instead).
+        if gestureModel == nil {
+            let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.toggle))
+            container.addGestureRecognizer(tap)
+        }
         return container
     }
 
@@ -459,6 +556,9 @@ struct CoverPlayerView: UIViewRepresentable {
         let c = context.coordinator
         c.onPlayingChange = { playing in isPlaying = playing }
         c.onError = { msg in errorMsg = msg }
+        c.bindGestureModel(gestureModel, container: uiView)
+        c.onNearEnd = onNearEnd
+        c.onEnded = onEnded
         c.sync(container: uiView, card: card, url: urlString, active: active,
                muted: muted, volume: volume, onProgress: onProgress)
     }
@@ -480,11 +580,44 @@ struct CoverPlayerView: UIViewRepresentable {
         private var currentItemObs: NSKeyValueObservation?
         private var itemStatusObs: NSKeyValueObservation?
         private var failedObs: NSObjectProtocol?
+        private var endedObs: NSObjectProtocol?
         private var historyTimer: Timer?
+        private var nearEndFired = false
+        // v1.2.0 gesture bridge (weak: SwiftUI owns the model).
+        private weak var gestureModel: PlayerGestureModel?
+        private var gesturesAttached = false
 
         var onPlayingChange: ((Bool) -> Void)?
         var onError: ((String?) -> Void)?
         var onProgress: ((Double, Double) -> Void)?
+        var onNearEnd: (() -> Void)?
+        var onEnded: (() -> Void)?
+
+        /// Wire the SwiftUI gesture model to this player: expose the
+        /// AVPlayerLayer for the fullscreen stage, install UIKit
+        /// recognizers once, and route model commands back here.
+        func bindGestureModel(_ model: PlayerGestureModel?, container: PlayerContainerView) {
+            if let model {
+                gestureModel = model
+                model.playerLayer = container.videoLayer
+                if !gesturesAttached {
+                    model.attach(to: container)
+                    gesturesAttached = true
+                }
+                model.onTogglePlay = { [weak self] in
+                    // Keep user-pause semantics identical to the old tap.
+                    self?.toggle()
+                }
+                model.onSeek = { [weak self] t, _ in
+                    self?.seek(to: t)
+                }
+                model.onRateChange = { [weak self] rate in
+                    self?.applyRate(rate)
+                }
+            } else {
+                gestureModel = nil
+            }
+        }
 
         func sync(container: PlayerContainerView, card: VideoCard, url: String?,
                   active: Bool, muted: Bool, volume: Double,
@@ -495,7 +628,11 @@ struct CoverPlayerView: UIViewRepresentable {
             loadPosterIfNeeded(card: card)
             if url != currentURL {
                 currentURL = url
+                nearEndFired = false
                 rebuildPlayer(url: url)
+                // New media: reset transient gesture state so a stale scrub
+                // target or zoom transform does not leak into the next item.
+                gestureModel?.resetForNewMedia()
             }
             let becameActive = active && !self.active
             let becameInactive = !active && self.active
@@ -512,6 +649,8 @@ struct CoverPlayerView: UIViewRepresentable {
         func teardown() {
             historyTimer?.invalidate()
             historyTimer = nil
+            uiTickTimer?.invalidate()
+            uiTickTimer = nil
             watchdogTimer?.invalidate()
             watchdogTimer = nil
             removeObservers()
@@ -521,6 +660,7 @@ struct CoverPlayerView: UIViewRepresentable {
             container = nil
             posterTask?.cancel()
             posterTask = nil
+            gestureModel = nil
         }
 
         @objc func toggle() {
@@ -534,10 +674,38 @@ struct CoverPlayerView: UIViewRepresentable {
             }
         }
 
+        /// v1.2.0: precise seek used by the progress bar and the
+        /// horizontal-drag gesture. Clamps into the item duration.
+        func seek(to t: Double) {
+            guard let p = player, let item = p.currentItem else { return }
+            let dur = item.duration.seconds
+            let target = dur.isFinite && dur > 0 ? min(max(0, t), dur - 0.15) : max(0, t)
+            p.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+        }
+
+        /// v1.2.0: base/hold/locked playback rate (2x long-press etc.).
+        /// Setting AVPlayer.rate while paused keeps the item paused, so use
+        /// playImmediately(atRate:) for the resume path.
+        func applyRate(_ rate: Float) {
+            guard let p = player else { return }
+            if rate <= 0 {
+                p.pause()
+                return
+            }
+            if userPaused { userPaused = false }
+            if p.rate == 0 {
+                p.playImmediately(atRate: rate)
+            } else if p.rate != rate {
+                p.rate = rate
+            }
+        }
+
         private func rebuildPlayer(url: String?) {
             removeObservers()
             watchdogTimer?.invalidate()
             watchdogTimer = nil
+            uiTickTimer?.invalidate()
+            uiTickTimer = nil
             player?.pause()
             player = nil
             container?.videoLayer.player = nil
@@ -559,6 +727,7 @@ struct CoverPlayerView: UIViewRepresentable {
                 p.pause()
             }
             startHistoryTimer()
+            startUITick()
             startWatchdog()
         }
 
@@ -627,6 +796,17 @@ struct CoverPlayerView: UIViewRepresentable {
                 let err = item?.error
                 self.handleFailure(self.diagnosticForItemError(err))
             }
+            // v1.2.0: natural end → next episode (see onEnded / onNearEnd).
+            endedObs = NotificationCenter.default.addObserver(
+                forName: AVPlayerItem.didPlayToEndTimeNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                if !self.nearEndFired {
+                    self.nearEndFired = true
+                    self.onEnded?()
+                }
+            }
         }
 
         private func observeCurrentItem(_ item: AVPlayerItem?) {
@@ -648,6 +828,10 @@ struct CoverPlayerView: UIViewRepresentable {
             if let failedObs {
                 NotificationCenter.default.removeObserver(failedObs)
                 self.failedObs = nil
+            }
+            if let endedObs {
+                NotificationCenter.default.removeObserver(endedObs)
+                self.endedObs = nil
             }
         }
 
@@ -680,6 +864,7 @@ struct CoverPlayerView: UIViewRepresentable {
             } else {
                 container?.setLoading(false)
             }
+            gestureModel?.isPlaying = playing
             onPlayingChange?(playing)
         }
 
@@ -736,6 +921,33 @@ struct CoverPlayerView: UIViewRepresentable {
                 let dur = p.currentItem?.duration.seconds ?? 0
                 if t.isFinite {
                     self?.onProgress?(t, dur.isFinite ? dur : 0)
+                }
+            }
+        }
+
+        /// v1.2.0: 10Hz UI tick. Feeds the gesture model (progress bar,
+        /// scrub base) and fires the near-end hook 0.35s early — some HLS
+        /// containers report a duration slightly longer than the last
+        /// segment, so waiting for didPlayToEndTime stalls on the final
+        /// frame (mirrors VideoSurface.tsx nearEndFiredRef).
+        private var uiTickTimer: Timer?
+        private func startUITick() {
+            uiTickTimer?.invalidate()
+            uiTickTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                guard let p = self.player else { return }
+                let t = p.currentTime().seconds
+                let dur = p.currentItem?.duration.seconds ?? 0
+                guard t.isFinite else { return }
+                // Publish to the gesture model on main (Timer is main-only).
+                if let m = self.gestureModel {
+                    if !m.barScrubbing, self.gestureModel?.scrub == nil { m.currentTime = t }
+                    if dur.isFinite, dur > 0 { m.duration = dur }
+                    // Near-end auto-advance.
+                    if !self.nearEndFired, dur > 5, t >= dur - 0.35 {
+                        self.nearEndFired = true
+                        m.onNearEnd?()
+                    }
                 }
             }
         }

@@ -334,6 +334,7 @@ struct LinePickerView: View {
     @State private var mirrors: [LineItem] = []
     @State private var probes: [String: LineProbe] = [:]
     @State private var loading = false
+    @State private var probing = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -361,7 +362,9 @@ struct LinePickerView: View {
                             HStack {
                                 Text(m.host ?? m.url).font(.caption)
                                 Spacer()
-                                if let p = probes[m.url] {
+                                if probing {
+                                    ProgressView()
+                                } else if let p = probes[m.url] {
                                     Text(p.ok ? "\(p.ms)ms" : "不可达").font(.caption2)
                                         .foregroundStyle(p.ok ? .green : .red)
                                 }
@@ -377,7 +380,10 @@ struct LinePickerView: View {
                     Button("刷新") { Task { await refresh() } }
                 }
                 ToolbarItem(placement: .primaryAction) {
-                    Button("探测") { Task { await probeAll() } }
+                    Button(probing ? "测速中…" : "探测") {
+                        guard !probing else { return }
+                        Task { await probeAll() }
+                    }
                 }
             }
             .task { await refresh() }
@@ -390,8 +396,12 @@ struct LinePickerView: View {
         loading = false
     }
     func probeAll() async {
+        // v1.2.0: visible probing state (mirrors LNPANDY's probe spinner);
+        // per-probe 8s timeout now lives in API.probeOne.
+        probing = true
         let results = await api.lineProbe(urls: mirrors.map(\.url))
         for r in results { probes[r.url] = r }
+        probing = false
     }
 }
 
